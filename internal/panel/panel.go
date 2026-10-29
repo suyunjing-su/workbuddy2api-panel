@@ -252,6 +252,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.loginRegions)
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.importCockpit)
 	p.mux.HandleFunc("POST /panel/api/accounts/add_apikey", p.addAPIKey)
+	p.mux.HandleFunc("POST /panel/api/accounts/add_token", p.addManualToken)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.accountRevive)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.accountDisable)
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.accountPause)
@@ -289,13 +290,6 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/update", p.updateStatus)
 	p.mux.HandleFunc("POST /panel/api/update/check", p.checkUpdate)
 	p.mux.HandleFunc("POST /panel/api/update/install", p.installUpdate)
-}
-
-// publicPanelPaths 免鉴权的精确路径：静态页面与脚本本身不含秘密，其余一律要密钥。
-var publicPanelPaths = map[string]struct{}{
-	"/panel/":         {},
-	"/panel/theme.js": {},
-	"/panel/app.js":   {},
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
