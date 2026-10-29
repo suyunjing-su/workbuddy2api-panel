@@ -1696,6 +1696,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <button class="tab on" data-tab="login">浏览器登录</button>
         <button class="tab" data-tab="import">导入 JSON</button>
         <button class="tab" data-tab="apikey">API Key</button>
+        <button class="tab" data-tab="manual">手动令牌</button>
       </div>
     </header>
     <div class="body">
@@ -1729,6 +1730,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div id="apiKeyDone" class="state ok" hidden></div>
         <div id="apiKeyErr" class="state err" hidden></div>
       </div>
+      <!-- 手动输入国内版 OAuth 令牌 -->
+      <div id="addTabManual" class="tab-panel" hidden>
+        <div class="hint" style="margin-bottom:8px">仅支持国内版 OAuth 令牌。输入 access token 与 refresh token；后端将验证令牌并自动获取账号信息。</div>
+        <input type="password" id="manualAccessToken" placeholder="Access token" autocomplete="off" style="width:100%;margin-bottom:8px">
+        <input type="password" id="manualRefreshToken" placeholder="Refresh token" autocomplete="off" style="width:100%;margin-bottom:8px">
+        <div id="manualTokenDone" class="state ok" hidden></div>
+        <div id="manualTokenErr" class="state err" hidden></div>
+      </div>
       <!-- 导入 JSON -->
       <div id="addTabImport" class="tab-panel" hidden>
         <div class="hint" style="margin-bottom:8px">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
@@ -1741,6 +1750,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <span class="grow"></span>
       <button id="btnStartLogin" class="primary">获取授权链接</button>
       <button id="btnAddApiKey" hidden class="primary">添加 API Key</button>
+      <button id="btnAddManualToken" hidden class="primary">验证并添加</button>
       <button id="btnCopyUrl" hidden>复制链接</button>
       <button id="btnOpenUrl" class="primary" hidden>在浏览器打开</button>
       <button id="btnCloseAdd">关闭</button>

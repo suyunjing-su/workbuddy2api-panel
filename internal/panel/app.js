@@ -1844,10 +1844,13 @@ function openAdd() {
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('importDone').hidden = true; $('importErr').hidden = true;
   $('apiKeyDone').hidden = true; $('apiKeyErr').hidden = true;
+  $('manualTokenDone').hidden = true; $('manualTokenErr').hidden = true;
+  $('manualAccessToken').value = ''; $('manualRefreshToken').value = '';
+  $('btnAddManualToken').hidden = true;
+  $('btnAddApiKey').hidden = true;
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
   $('addQr').hidden = true; $('addQr').innerHTML = ''; // 上一次的 state 已作废，二维码不留
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
-  $('btnAddApiKey').hidden = true;
   stopPoll();
 }
 function switchAddTab(tab) {
@@ -1855,8 +1858,10 @@ function switchAddTab(tab) {
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
   $('addTabApiKey').hidden = tab !== 'apikey';
-  // 页脚按钮随标签切：登录页「获取授权链接」、API Key 页「添加 API Key」，导入页无页脚按钮。
+  $('addTabManual').hidden = tab !== 'manual';
+  // 页脚按钮随标签切：登录页「获取授权链接」、API Key 页「添加 API Key」、手动令牌页「验证并添加」。
   $('btnAddApiKey').hidden = tab !== 'apikey';
+  $('btnAddManualToken').hidden = tab !== 'manual';
   $('btnStartLogin').hidden = tab !== 'login' || loginState != null;
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
@@ -1956,6 +1961,34 @@ async function pollLogin() {
 function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
+
+$('btnAddManualToken').onclick = async () => {
+  const accessToken = ($('manualAccessToken').value || '').trim();
+  const refreshToken = ($('manualRefreshToken').value || '').trim();
+  $('manualTokenDone').hidden = true; $('manualTokenErr').hidden = true;
+  if (!accessToken || !refreshToken) {
+    $('manualTokenErr').hidden = false;
+    $('manualTokenErr').textContent = '请填写 access token 和 refresh token';
+    return;
+  }
+  const btn = $('btnAddManualToken');
+  btn.disabled = true;
+  try {
+    const r = await api('accounts/add_token', {
+      method: 'POST',
+      body: JSON.stringify({ access_token: accessToken, refresh_token: refreshToken }),
+    });
+    $('manualTokenDone').hidden = false;
+    $('manualTokenDone').textContent = '已添加 ' + (r.nickname || r.uid) + '（国内版），账号已载入池中' +
+      (r.balance_error ? '；余额校验失败：' + r.balance_error : '');
+    $('manualAccessToken').value = ''; $('manualRefreshToken').value = '';
+    invalidatePackages();
+    setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
+  } catch (e) {
+    $('manualTokenErr').hidden = false;
+    $('manualTokenErr').textContent = '添加失败：' + e.message;
+  } finally { btn.disabled = false; }
+};
 
 $('btnAddApiKey').onclick = async () => {
   const token = ($('apiKeyInput').value || '').trim();
