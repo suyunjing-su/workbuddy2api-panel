@@ -943,6 +943,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var modelBlock pool.ModelBlockStatus
 	// busyWaited 本次请求是否已经为「模型繁忙」等过一轮（issue #46，见 acct==nil 分支）。
 	busyWaited := false
+	// slotWaited 本次请求是否已经为「号都在途占满」等过一轮名额（issue #117）。
+	slotWaited := false
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -1205,6 +1207,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 				}
+			}
+			// issue #117：全池该模型没号，但原因不是冷却而是**在途占满**时，等一个
+			// 名额再试一次。此前直接 503「all accounts are temporarily unavailable」，
+			// 而真实情况是并发把剩下的号打满了 max_in_flight：两号池里一号撞 6004 锁
+			// 模型后只剩 3 个名额，第 4 个并发请求必然 503，其实几十毫秒后就有名额。
+			// 只等一次、不占在途名额；上限 busyWaitCap（与 14003 同一预算）。
+			// 放在 14003 busy-wait 之后：那是有解封时刻的确定性等待，优先级更高。
+			if !slotWaited && h.cfg.Pool.SlotWaitForRealm(curModel, realm) {
+				slotWaited = true
+				log.Printf("slot-wait: model=%s realm=%q all healthy accounts at in-flight cap, waiting up to %s then retry once (issue #117)",
+					bareModel, realm, busyWaitCap)
+				if !waitForSlot(r.Context(), h.cfg.Pool, curModel, realm) {
+					break // 客户端已断连：不必再等
+				}
+				i-- // 等待不算一次换号：槽位留给真正的尝试
+				continue
 			}
 			st.status = http.StatusServiceUnavailable
 			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
