@@ -28,6 +28,7 @@ import (
 	"github.com/misakano7545/workbuddy2api-panel/internal/livecfg"
 	"github.com/misakano7545/workbuddy2api-panel/internal/panel"
 	"github.com/misakano7545/workbuddy2api-panel/internal/pool"
+	"github.com/misakano7545/workbuddy2api-panel/internal/proxypool"
 	"github.com/misakano7545/workbuddy2api-panel/internal/redisstore"
 	"github.com/misakano7545/workbuddy2api-panel/internal/reqlog"
 	"github.com/misakano7545/workbuddy2api-panel/internal/safefile"
@@ -149,6 +150,7 @@ func main() {
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+	p.SetBalanceWindow(cfg.BalanceWindowDur)             // 窗口用量调度（issue #112，默认 1h；0 关停）
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	p.SetCreditFloorMaxRate(cfg.Pool.CreditFloorMaxRate) // 保底兜底的目录倍率上限（0 = 严格模式）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
@@ -207,8 +209,16 @@ func main() {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
+	proxies, err := proxypool.New(stateSibling(cfg.StateFile, "proxy-pool.json"),
+		up.HTTP.Transport.(*http.Transport), upstream.NewDNSDialer(cfg.DNSServers))
+	if err != nil {
+		log.Fatalf("proxy pool: %v", err)
+	}
+	defer proxies.Close()
+	up.ProxyPool = proxies
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(cfg.Features.SanitizeBrandScope)
+	up.KeepRecentRounds.Store(int64(cfg.Prompt.KeepRecentRounds))
 	// 思考档位策略（thinking 节）：启动装载，面板保存配置时经 saveConfig 热更新。
 	up.SetEffortPolicy(effortPolicyOf(cfg))
 	if cfg.Thinking.Enabled {
@@ -269,18 +279,17 @@ func main() {
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
-		BlackcatHours:  cfg.Schedule.BlackcatHours,
 		GrowthHours:    cfg.Schedule.GrowthHours,
 		// 余额采样记录器：挂在余额刷新之后（scheduler 内），nil = 不采样。
 		Balance: bal,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
-		ExpiringSoonWindow: cfg.ExpiringSoonDur,
-		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:     !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
-		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
-		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
+		ExpiringSoonWindow:  cfg.ExpiringSoonDur,
+		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:      !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
+		WebActivityDisabled: !cfg.Schedule.WebActivityEnabled,
+		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
+		GrowthDisabled:      !cfg.Schedule.GrowthEnabled,
 		// 周期保活只刷新临期凭证（默认 7 天窗口）；面板手动全量保活不受影响。
 		KeepaliveRefreshWindow: cfg.KeepaliveRefreshWindowDur,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
@@ -316,12 +325,6 @@ func main() {
 		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
 	}
 	switch {
-	case !cfg.Schedule.BlackcatEnabled:
-		log.Printf("夜猫子已禁用（schedule.blackcat_enabled=false）")
-	default:
-		log.Printf("夜猫子已启用：%v 点（23:00–08:00 窗口 glm-5.2 对话补足）", cfg.Schedule.BlackcatHours)
-	}
-	switch {
 	case !cfg.Schedule.GrowthEnabled:
 		log.Printf("成长任务队列已禁用（schedule.growth_enabled=false）")
 	default:
@@ -351,9 +354,6 @@ func main() {
 		log.Printf("周期抖动（人味化）：余额刷新 ±%d‰（账号遍历同步摊开）、补领清扫 ±%d‰，不再精确固定间隔（schedule.*_jitter_permill）",
 			cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
 	}
-	if cfg.Schedule.NightAccountCap > 0 {
-		log.Printf("夜间参与上限：夜猫子只让积分最高的前 %d 个号参加（schedule.night_account_cap）", cfg.Schedule.NightAccountCap)
-	}
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
 	}
@@ -369,6 +369,7 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		EmbeddingsEnabled:    cfg.Features.EmbeddingsEnabled,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		RecordContext:        cfg.Logging.RequestArchiveContext,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 		// 模型白名单（issue #68）：归一化集合 + 启用标志；空配置 = 不启用。
 		AllowedModels:    allowedModels,
@@ -426,6 +427,7 @@ func main() {
 	var pn *panel.Panel
 	pn = panel.New(panel.Config{
 		Pool:       p,
+		ProxyPool:  proxies,
 		Usage:      rec,
 		RequestLog: requestLog,
 		Upstream:   up,
@@ -511,6 +513,7 @@ func main() {
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		RecordContext:    cfg.Logging.RequestArchiveContext,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
@@ -531,6 +534,13 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	proxyCtx, stopProxies := context.WithCancel(ctx)
+	proxyDone := make(chan struct{})
+	go func() {
+		defer close(proxyDone)
+		proxies.Run(proxyCtx)
+	}()
+	defer func() { stopProxies(); <-proxyDone }()
 	updateManager.SetRestart(stop)
 	go updateManager.Run(ctx)
 	// 账号后台任务（taskjobs）：状态与主 state 同目录，重启后自动恢复未完成作业。
@@ -542,7 +552,6 @@ func main() {
 	pn.ResumeTaskJobs()
 	go sch.Run(ctx)
 	sch.SetJitter(cfg.Schedule.BalanceRefreshJitterPermill, cfg.Schedule.TaskSweepJitterPermill)
-	sch.SetNightAccountCap(cfg.Schedule.NightAccountCap)
 	sch.SetMakeupCardsPerRound(cfg.Schedule.MakeupCardsPerRound)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
@@ -837,6 +846,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		EmbeddingsEnabled:    newCfg.Features.EmbeddingsEnabled,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		RecordContext:        newCfg.Logging.RequestArchiveContext,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 		// 白名单热生效：与 HiddenModels 同一条快照重建通路（issue #68）。
 		AllowedModels:    newAllowedModels,
@@ -852,6 +862,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	up.SanitizeBrandScope.Store(newCfg.Features.SanitizeBrandScope)
+	up.KeepRecentRounds.Store(int64(newCfg.Prompt.KeepRecentRounds))
 	// 思考档位策略热生效：改默认档 / 切换客户端优先或作用域后，下一次 chat 即按新策略。
 	up.SetEffortPolicy(effortPolicyOf(newCfg))
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
@@ -860,6 +871,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
+	p.SetBalanceWindow(newCfg.BalanceWindowDur)             // 窗口用量调度热生效（0 关停）
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetCreditFloorMaxRate(newCfg.Pool.CreditFloorMaxRate) // 保底倍率上限热生效（0 = 严格模式）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
@@ -874,14 +886,13 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		TravelHours:    newCfg.Schedule.TravelHours,
 		ActivityHours:  newCfg.Schedule.ActivityHours,
 		KeepaliveHours: newCfg.Schedule.KeepaliveHours,
-		BlackcatHours:  newCfg.Schedule.BlackcatHours,
 		GrowthHours:    newCfg.Schedule.GrowthHours,
 
 		CheckinDisabled:        !newCfg.Schedule.CheckinEnabled,
 		TravelDisabled:         !newCfg.Schedule.TravelEnabled,
 		ActivityDisabled:       !newCfg.Schedule.ActivityEnabled,
+		WebActivityDisabled:    !newCfg.Schedule.WebActivityEnabled,
 		KeepaliveDisabled:      !newCfg.Schedule.KeepaliveEnabled,
-		BlackcatDisabled:       !newCfg.Schedule.BlackcatEnabled,
 		GrowthDisabled:         !newCfg.Schedule.GrowthEnabled,
 		IncludeDisabledInTasks: newCfg.Schedule.IncludeDisabledInTasks,
 
@@ -892,7 +903,6 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetJitter(newCfg.Schedule.BalanceRefreshJitterPermill, newCfg.Schedule.TaskSweepJitterPermill)
-	sch.SetNightAccountCap(newCfg.Schedule.NightAccountCap)
 	sch.SetMakeupCardsPerRound(newCfg.Schedule.MakeupCardsPerRound)
 	if pn != nil {
 		pn.SetGrowthConcurrency(newCfg.Schedule.GrowthConcurrency) // 排程轮次并发热生效
