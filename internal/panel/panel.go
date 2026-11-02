@@ -292,6 +292,13 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/update/install", p.installUpdate)
 }
 
+// publicPanelPaths 免鉴权的精确路径：静态页面与脚本本身不含秘密，其余一律要密钥。
+var publicPanelPaths = map[string]struct{}{
+	"/panel/":         {},
+	"/panel/theme.js": {},
+	"/panel/app.js":   {},
+}
+
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
 // 与 401 错误响应全都带上（API 也可能在浏览器里被直接打开）。
 //
