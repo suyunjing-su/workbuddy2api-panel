@@ -3,6 +3,7 @@ package upstream
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -632,6 +633,30 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
+	// br 在下面才初始化，但写帧闭包要用它判断「上游缓冲是否已读空」→ 先声明。
+	var br *bufio.Reader
+	// flushIfDrained 只在**下一帧不在本地缓冲里**时才 flush。
+	//
+	// 上游把一条长回答按 token 切成上万帧、成批到达：每帧都 flush 就是每帧一次
+	// write 系统调用，线上 profile 里 Flush+syscall 占流式 CPU 的近一半（14470 帧/
+	// 请求的实测形态）。本地缓冲里还有完整帧时立刻就会继续写，这次 flush 纯属浪费；
+	// 只有缓冲读空（下一次读会阻塞在 socket 上）才必须把已写内容推给客户端。
+	// 缓冲里只剩半行（没有换行符）也一样会阻塞，同样要 flush——否则上游若在此停顿，
+	// 客户端会一直等一个已经生成好的帧。
+	flushIfDrained := func() {
+		if fl == nil || br == nil {
+			return
+		}
+		switch n := br.Buffered(); {
+		case n == 0:
+			fl.Flush()
+		case n < 8192:
+			// 帧很小（~200B），缓冲还有 8KB 以上时必然含完整帧，不必扫。
+			if p, _ := br.Peek(n); bytes.IndexByte(p, '\n') < 0 {
+				fl.Flush()
+			}
+		}
+	}
 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
@@ -660,9 +685,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
 			return werr
 		}
-		if fl != nil {
-			fl.Flush()
-		}
+		flushIfDrained()
 		return nil
 	}
 
@@ -796,18 +819,41 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
 			return werr
 		}
-		if fl != nil {
-			fl.Flush()
-		}
+		flushIfDrained()
 		return nil
 	}
 
 	// writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 	// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
-	writeFrame := func(payload string) (int, error) {
+	// 声明与赋值分开：粘帧拆分需要递归调用本帧处理（见下方 issue #197 分支）。
+	var writeFrame func(string) (int, error)
+	writeFrame = func(payload string) (int, error) {
 		var obj map[string]any
 		if json.Unmarshal([]byte(payload), &obj) != nil {
-			// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。
+			// 粘帧（issue #197）：上游偶发把两个 chunk 塞进同一个 data 行，形如
+			// `data: {a} {b}`。原样透传会让客户端按 SSE 规范把整行当一个 JSON 解析，
+			// 直接失败在「第二个对象」上——报错是
+			// `Unexpected non-whitespace character after JSON at position N`
+			// 并且整轮对话作废。这里拆成多个对象逐个走常规路径，客户端每秒都在
+			// 解析合法帧，不会看到这个形态。
+			if parts := splitConcatenatedJSON(payload); len(parts) > 1 {
+				log.Printf("WARN: [upstream] data 帧内含 %d 个 JSON 对象（上游粘帧）→ 拆成独立帧透传，首个 %.120q",
+					len(parts), truncate(parts[0], 120))
+				n := 0
+				for _, part := range parts {
+					c, werr := writeFrame(part)
+					if werr != nil {
+						return n, werr
+					}
+					n += c
+				}
+				return n, nil
+			}
+			// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。留下 WARN 是因为
+			// 这是「客户端收到非协议帧」的唯一线索，静默透传时线上完全查不到。
+			if looksLikeJSON(payload) {
+				log.Printf("WARN: [upstream] data 帧不是合法 JSON → 原样透传 %.160q", truncate(payload, 160))
+			}
 			return 0, writeSSE(payload)
 		}
 		// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
@@ -839,7 +885,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		return 1, nil
 	}
 
-	br := bufio.NewReaderSize(r, 64*1024)
+	br = bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
 	// headOpen 首帧否决窗口：尚未向客户端写出任何字节。窗口内遇到上游 error 帧
 	// （或整个流零有效帧）就返回 HeadVetoError 而不写字节——上层据此换号重试，
@@ -901,9 +947,7 @@ readLoop:
 			if _, werr := io.WriteString(w, "\n"); werr != nil {
 				return werr
 			}
-			if fl != nil {
-				fl.Flush()
-			}
+			flushIfDrained()
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
 		if err != nil {

@@ -760,6 +760,74 @@ function renderUpdateStatus(update) {
   $('btnUpdateInstall').disabled = updateBusy || !!update.installing;
   $('btnUpdateRelease').hidden = (!update.update_available && !unknown) || !!update.can_install || !update.release_url;
   $('btnUpdateCheck').disabled = updateBusy || !!update.installing;
+  renderUpdateChannel(update);
+}
+
+// renderUpdateChannel 展示「更新走哪条通道」与上次失败的归因（issue #198）。
+//
+// 现场痛点：api.github.com 通、release-assets 被拦时，面板只显示一句原始超时文本，
+// 用户既不知道自己有没有走代理，也不知道下一步该配什么。这里把通道名与类目直接
+// 摆出来，并把类目翻成一句人话建议。
+const UPDATE_CHANNEL_LABEL = {
+  'direct': '直连（已关闭环境变量代理）',
+  'direct(env)': '直连（跟随环境变量）',
+  'proxy': '代理',
+  'mirror': '镜像',
+  'mirror+proxy': '镜像 + 代理',
+};
+const UPDATE_ERROR_ADVICE = {
+  'dns': '域名解析失败：检查容器 DNS（可用 dns_servers）与出站策略。',
+  'connect': 'TCP 连不上：出站被拦或网络不可达；可配「更新代理」或「镜像前缀」绕行。',
+  'tls': 'TLS 握手/证书失败：常见于中间设备劫持或系统 CA 过期；先试镜像。',
+  'header-timeout': '等响应头超时：出站到 release-assets 很可能被拦（api.github.com 往往仍通）；配代理或镜像即可。',
+  'body-stall': '下载中途停滞：链路抖动或镜像限速；换镜像或配代理。',
+  'checksum': '摘要/尺寸不符：下载内容被中间层改写；换回直连或换可信镜像（不要放宽校验）。',
+  'http': '对方返回非 200：镜像不可用或前缀路径不对；检查镜像前缀。',
+  'proxy-config': '代理地址不合法；只支持 http、https、socks5 三种协议。',
+  'mirror-config': '镜像前缀不合法；需要 http 或 https 加主机名加斜杠的形式。',
+};
+function renderUpdateChannel(update) {
+  const el = $('updateChannel');
+  if (!el) return;
+  const bits = ['通道：' + (UPDATE_CHANNEL_LABEL[update.channel] || update.channel || '未知')];
+  if (update.proxy_host) bits.push('代理 ' + update.proxy_host);
+  if (update.mirror) bits.push('镜像 ' + update.mirror);
+  el.textContent = bits.join(' · ');
+  const advice = UPDATE_ERROR_ADVICE[update.last_error_kind];
+  if (advice) {
+    el.textContent += ' ｜ 上次失败[' + update.last_error_kind + ']：' + advice;
+    el.style.color = 'var(--warn)';
+  } else {
+    el.style.color = '';
+  }
+}
+
+// 测试连通性：分别探「版本元数据」与「资产下载」两条路，把结果逐行摆出来。
+// 检查更新只回答「有没有新版本」，通道坏的时候它给不出「坏在哪一段」。
+async function probeUpdateChannel() {
+  const button = $('btnUpdateProbe');
+  const out = $('updateProbeOut');
+  button.disabled = true;
+  button.textContent = '探测中…';
+  out.hidden = false;
+  out.textContent = '正在探测…';
+  try {
+    const r = await api('update/probe', { method: 'POST' });
+    const rows = [r.meta, r.asset].filter(Boolean).map(p => {
+      const state = p.ok ? '通' : ('失败[' + (p.kind || 'unknown') + ']');
+      const extra = p.ok ? ('HTTP ' + p.status) : (p.error || '');
+      return p.target + '：' + state + ' · ' + p.elapsed_ms + 'ms · ' + extra;
+    });
+    out.innerHTML = rows.map(t => '<div>' + esc(t) + '</div>').join('');
+    const advice = UPDATE_ERROR_ADVICE[(r.meta && r.meta.kind) || (r.asset && r.asset.kind)];
+    if (advice) out.innerHTML += '<div style="color:var(--warn)">' + esc(advice) + '</div>';
+    if (r.update) renderUpdateStatus(r.update);
+  } catch (e) {
+    out.textContent = '探测失败：' + e.message;
+  } finally {
+    button.disabled = false;
+    button.textContent = '测试连通性';
+  }
 }
 
 async function checkForUpdates() {
@@ -810,6 +878,7 @@ function openLatestRelease() {
 }
 
 if ($('btnUpdateCheck')) $('btnUpdateCheck').onclick = checkForUpdates;
+if ($('btnUpdateProbe')) $('btnUpdateProbe').onclick = probeUpdateChannel;
 if ($('btnUpdateInstall')) $('btnUpdateInstall').onclick = installUpdate;
 if ($('btnUpdateRelease')) $('btnUpdateRelease').onclick = openLatestRelease;
 if ($('navUpdate')) $('navUpdate').onclick = () => {
@@ -1792,6 +1861,30 @@ function fmtBytes(bytes) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
   return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
+/* 运行日志导出：落盘文件按区间打包成 ZIP。
+ * 用 location.href 直接触发下载而不是 fetch+blob——落盘包可能几十 MB，
+ * blob 会把整包读进内存再复制一份；href 让浏览器原生流式落盘。
+ * 失败（落盘未启用 / 区间无数据）时后端回 JSON 错误，浏览器会把它当文件下载，
+ * 所以先 HEAD 一次拿状态码，非 2xx 就读回错误文案弹出来。 */
+$('btnLogExport').onclick = async () => {
+  const days = $('logExportDays').value || '3';
+  const url = '/panel/api/logs/export?days=' + encodeURIComponent(days);
+  try {
+    const resp = await fetch(url, {method: 'HEAD'});
+    if (!resp.ok) {
+      // HEAD 不带 body，再 GET 一次拿文案（数据量很小：只有一个错误 JSON）。
+      const detail = await fetch(url).then(r => r.text()).catch(() => '');
+      let msg = 'HTTP ' + resp.status;
+      try { msg = JSON.parse(detail).error || msg; } catch (e) { }
+      alert('导出失败：' + msg);
+      return;
+    }
+    location.href = url;
+  } catch (e) {
+    alert('导出失败：' + e);
+  }
+};
+
 $('btnLogPin').onclick = () => {
   logPin = !logPin;
   $('btnLogPin').textContent = '自动滚动：' + (logPin ? '开' : '关');
@@ -1802,6 +1895,8 @@ const CFG_MAP = {
   listen: ['listen'], api_key: ['api_key'],
   package_detail_limit: ['panel', 'package_detail_limit'],
   update_auto_enabled: ['update', 'auto_enabled'], update_auto_time: ['update', 'auto_time'],
+  update_proxy: ['update', 'proxy'], update_mirror: ['update', 'mirror'],
+  update_proxy_from_env: ['update', 'proxy_from_env'],
   poll_interval_sec: ['panel', 'poll_interval_sec'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
@@ -2066,6 +2161,9 @@ $('cfgForm').onsubmit = async ev => {
 };
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
+// 导入预览态的暂存：{files: File[], ready: bool, result?: 预览响应}。
+// 只活到确认导入或关闭弹窗为止；File 对象本身在浏览器里，再次 POST 时重发即可。
+let importPending = null;
 function openAdd() {
   $('addVeil').classList.add('on');
   // 重置到登录标签
@@ -2090,10 +2188,12 @@ function switchAddTab(tab) {
   $('addTabImport').hidden = tab !== 'import';
   $('addTabApiKey').hidden = tab !== 'apikey';
   $('addTabManual').hidden = tab !== 'manual';
-  // 页脚按钮随标签切：登录页「获取授权链接」、API Key 页「添加 API Key」、手动令牌页「验证并添加」。
+  // 页脚按钮随标签切：登录页「获取授权链接」、API Key 页「添加 API Key」、
+  // 导入页「确认导入」（仅预览通过后出现，见 renderImportPreview）。
   $('btnAddApiKey').hidden = tab !== 'apikey';
   $('btnAddManualToken').hidden = tab !== 'manual';
   $('btnStartLogin').hidden = tab !== 'login' || loginState != null;
+  $('btnImportCommit').hidden = !(tab === 'import' && importPending && importPending.ready);
 }
 document.querySelectorAll('#addTabs .tab').forEach(b => {
   b.onclick = () => switchAddTab(b.dataset.tab);
@@ -2189,7 +2289,17 @@ async function pollLogin() {
     $('addErr').textContent = '网络中断，自动重试中（' + pollFails + '/' + POLL_MAX_FAILS + '）：' + e.message;
   }
 }
-function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() {
+  stopPoll(); loginState = null; $('addVeil').classList.remove('on');
+  // 导入预览态一并清掉：关掉弹窗再打开时不该还挂着上一次的文件和「确认导入」。
+  importPending = null;
+  $('importPreview').hidden = true;
+  $('importPreview').innerHTML = '';
+  $('btnImportCommit').hidden = true;
+  $('importDone').hidden = true;
+  $('importErr').hidden = true;
+  $('importFile').value = '';
+}
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 
@@ -2249,31 +2359,97 @@ $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
 $('btnCopyUrl').onclick = () => navigator.clipboard.writeText($('addUrl').textContent)
   .then(() => toast('链接已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
 $('importFile').onchange = async () => {
-  const file = $('importFile').files[0];
-  if (!file) return;
+  const files = Array.from($('importFile').files || []);
   $('importDone').hidden = true; $('importErr').hidden = true;
-  const fd = new FormData();
-  fd.append('file', file);
-  const h = {};
-  const k = localStorage.getItem(LS_KEY);
-  if (k) h['Authorization'] = 'Bearer ' + k;
+  importPending = null;
+  $('importPreview').hidden = true;
+  $('btnImportCommit').hidden = true;
+  if (!files.length) return;
+  // 导入是不可逆动作（覆盖已有凭据前还要过上游校验），所以分两步：选中文件后先
+  // 发一次 dryRun 预览——服务端只做解析、必填、uid 合法性与批内去重，不落盘、
+  // 不发上游请求；点「确认导入」才真正写入。
+  //
+  // 多文件在服务端是整体事务：任一文件不是合法 JSON 或没有任何账号就整体 400，
+  // 不做「先把前面那部分导进去」。顺序即选择顺序（先选的优先）。
+  importPending = { files, ready: false };
+  const label = files.length > 1 ? files.length + ' 个文件' : files[0].name;
+  $('importPreview').hidden = false;
+  $('importPreview').innerHTML = '<div class="hint">正在校验 ' + esc(label) + '…</div>';
   try {
-    const r = await fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h });
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    const d = await postImport(true);
+    importPending.result = d;
+    importPending.ready = true;
+    renderImportPreview(label, d);
+    $('btnImportCommit').hidden = false;
+  } catch (e) {
+    importPending = null;
+    $('importPreview').innerHTML = '<div class="hint" style="color:var(--warn)">校验失败，未导入任何账号：' + esc(e.message) + '</div>';
+    $('btnImportCommit').hidden = true;
+  }
+};
+$('btnImportCommit').onclick = async () => {
+  if (!importPending || !importPending.ready) return;
+  const btn = $('btnImportCommit');
+  btn.disabled = true;
+  const label = importPending.files.length > 1 ? importPending.files.length + ' 个文件' : importPending.files[0].name;
+  try {
+    const d = await postImport(false);
+    $('importPreview').hidden = true;
     $('importDone').hidden = false;
-    $('importDone').textContent = '导入完成：成功 ' + d.imported + ' 个' + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
-    if (d.errors && d.errors.length) {
-      console.warn('import errors:', d.errors);
-    }
+    $('importDone').textContent = '导入完成（' + label + '）：新增 ' + (d.creates || 0)
+      + ' 个，覆盖 ' + (d.overwrites || 0) + ' 个'
+      + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
+    if (d.errors && d.errors.length) console.warn('import errors:', d.errors);
+    importPending = null;
+    $('btnImportCommit').hidden = true;
     invalidatePackages();
     loadOverview(true);
   } catch (e) {
     $('importErr').hidden = false;
     $('importErr').textContent = '导入失败：' + e.message;
+    btn.disabled = false;
   }
   $('importFile').value = '';
 };
+
+// 预览区：先给一句人话结论（新增/覆盖/跳过），再列具体条目问题。
+// 跳过项只列前 20 条——几百条的清单塞进弹窗只会把「结论」顶出视野。
+function renderImportPreview(label, d) {
+  const bits = ['新增 ' + (d.creates || 0) + ' 个', '覆盖 ' + (d.overwrites || 0) + ' 个'];
+  if (d.skipped) bits.push('跳过 ' + d.skipped + ' 个');
+  let html = '<div class="hint"><b>' + esc(label) + '</b> · 共 ' + (d.total || 0) + ' 条：' + bits.join('，') + '</div>';
+  if (d.overwrites) {
+    html += '<div class="hint" style="font-size:12px">覆盖项会先用 refresh 向上游求证新凭据可用，通过才写盘；不通过则保留原有凭据。</div>';
+  }
+  const errs = d.errors || [];
+  if (errs.length) {
+    const shown = errs.slice(0, 20);
+    html += '<div class="hint" style="font-size:12px;margin-top:4px;color:var(--ink-3)">跳过明细'
+      + (errs.length > shown.length ? '（前 ' + shown.length + ' 条，共 ' + errs.length + ' 条）' : '')
+      + '：</div><div style="max-height:120px;overflow:auto;font-size:12px;color:var(--ink-2)">'
+      + shown.map(e => '<div>' + esc(e) + '</div>').join('') + '</div>';
+  }
+  if (!d.imported) {
+    html += '<div class="hint" style="color:var(--warn)">没有可导入的账号。</div>';
+  }
+  $('importPreview').innerHTML = html;
+}
+
+// 导入请求：多文件按选择顺序塞进同一个 multipart，服务端逐份解码后合并。
+function postImport(dryRun) {
+  const fd = new FormData();
+  for (const f of importPending.files) fd.append('file', f, f.name);
+  if (dryRun) fd.append('dryRun', 'true');
+  const h = {};
+  const k = localStorage.getItem(LS_KEY);
+  if (k) h['Authorization'] = 'Bearer ' + k;
+  return fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h })
+    .then(async r => {
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      return d;
+    });
+}
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
@@ -3895,7 +4071,7 @@ function expBucketList(a) {
   for (const b of raw) {
     const date = String((b && b.date) || '').slice(0, 10);
     const remain = Number((b && b.remain) || 0);
-    if (date && remain > 0) out.push({ date, remain });
+    if (date && remain > 0) out.push({ date, remain, estimated: !!(b && b.estimated) });
   }
   if (out.length) {
     out.sort((x, y) => (x.date < y.date ? -1 : x.date > y.date ? 1 : 0));
@@ -3954,6 +4130,7 @@ function renderExpirySnapshot(d) {
       '<span class="exp-date">' + esc(first.date) + '</span>' +
       '<span class="exp-days">（' + when + '）</span>' +
       (week > first.remain ? '<span class="exp-week">7 天内合计 <b>' + fmtTok(week) + '</b></span>' : '') +
+      (first.estimated ? '<span class="exp-est" title="该日期是按计量周期（CycleEndTime）推算的，不是上游给出的真实扣费截止">按计量周期推算</span>' : '') +
       '</div>';
     const rest = bs.slice(1, 4).map(b => '<span>随后 ' + esc(b.date.slice(5)) + ' · ' +
       fmtTok(b.remain) + '</span>').join('');

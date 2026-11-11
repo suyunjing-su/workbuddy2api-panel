@@ -4,7 +4,7 @@
 // 同一鉴权形态，实测 2026-10-01：无需 Web 会话 cookie）。
 //
 // 隐私边界（重要）：该接口响应包含手机号（phoneNumber）等个人敏感信息。本方法
-// 只解析 nickname、uid 与 enterpriseId（uid 仅做一致性核对），其余字段一概不解析、不落日志、
+// 只解析 uid、nickname 与 enterpriseId（uid 仅做一致性核对），其余字段一概不解析、不落日志、
 // 不透传——调用方也拿不到。昵称同步只在面板手动「刷新」时触发，后台余额定时
 // 刷新不调用本接口。
 package upstream
@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/misakano7545/workbuddy2api-panel/internal/auth"
 )
@@ -27,6 +28,9 @@ type AccountProfile struct {
 
 // fetchAccountProfile 拉取账号资料。uid 与凭证不一致时报错（防串号）；
 // 业务/网络错误原样返回，调用方决定是否静默跳过。
+//
+// 响应形态两种都接：`{code:0,msg:...,data:{uid,nickname}}` 信封，以及顶层平铺的
+// `{uid,nickname}`。信封解析后 data 为空时回落到原始响应体。
 func (c *Client) fetchAccountProfile(a *auth.Auth) (AccountProfile, error) {
 	req, err := http.NewRequest(http.MethodGet, c.webBase(a)+"/console/account", nil)
 	if err != nil {
@@ -40,23 +44,26 @@ func (c *Client) fetchAccountProfile(a *auth.Auth) (AccountProfile, error) {
 	if ua := c.userAgent(a); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
-	data, err := c.doJSON(req, a)
+	env, raw, err := c.doJSONRaw(req, a)
 	if err != nil {
 		return AccountProfile{}, err
 	}
-	// 只取身份字段：敏感信息（手机号等）在这里就被丢弃，不进入任何后续路径。
+	payload := []byte(env.Data)
+	if len(payload) == 0 {
+		payload = raw
+	}
 	var resp struct {
 		UID          string `json:"uid"`
 		Nickname     string `json:"nickname"`
 		EnterpriseID string `json:"enterpriseId"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := json.Unmarshal(payload, &resp); err != nil {
 		return AccountProfile{}, fmt.Errorf("profile parse: %w", err)
 	}
 	if resp.UID != "" && a.UID != "" && resp.UID != a.UID {
 		return AccountProfile{}, fmt.Errorf("profile uid mismatch: resp=%s auth=%s", resp.UID, a.UID)
 	}
-	return AccountProfile{UID: resp.UID, Nickname: resp.Nickname, EnterpriseID: resp.EnterpriseID}, nil
+	return AccountProfile{UID: resp.UID, Nickname: strings.TrimSpace(resp.Nickname), EnterpriseID: resp.EnterpriseID}, nil
 }
 
 // FetchAccountProfile 拉取账号资料并返回最新昵称。uid 与凭证不一致时报错
@@ -65,6 +72,9 @@ func (c *Client) FetchAccountProfile(a *auth.Auth) (string, error) {
 	profile, err := c.fetchAccountProfile(a)
 	if err != nil {
 		return "", err
+	}
+	if profile.Nickname == "" {
+		return "", fmt.Errorf("profile response has no nickname")
 	}
 	return profile.Nickname, nil
 }
@@ -75,6 +85,9 @@ func (c *Client) FetchAccountIdentity(a *auth.Auth) (uid, nickname, enterpriseID
 	profile, err := c.fetchAccountProfile(a)
 	if err != nil {
 		return "", "", "", err
+	}
+	if profile.Nickname == "" {
+		return "", "", "", fmt.Errorf("profile response has no nickname")
 	}
 	return profile.UID, profile.Nickname, profile.EnterpriseID, nil
 }
