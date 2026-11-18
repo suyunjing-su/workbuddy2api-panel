@@ -349,15 +349,23 @@ func NewHandler(cfg Config) *Handler {
 	return h
 }
 
-// isChatEntry 四条入站协议路径：/v1/responses 与 /v1/messages（含 /messages 别名）
-// 经 r.Clone 转进 chatCompletions 内核，与直连的 /v1/chat/completions 共用同一套
-// 行日志/归档/来源采集/X-Request-Id——四者一视同仁，别再按单路径放行（Codex 走
+// isChatEntry 需要挂 requestTrace 的入站路径（/v1/responses 与 /v1/messages（含 /messages
+// 别名）经 r.Clone 转进 chatCompletions 内核，与直连的 /v1/chat/completions 共用同一套
+// 行日志/归档/来源采集/X-Request-Id——一视同仁，别再按单路径放行（Codex 走
 // /v1/responses，曾因此整类请求无来源、不入归档）。
+//
+// 出图/出视频/3D 也在表里：它们不扣 chat 的 token，但同样按上游回执扣积分，
+// 不进台账就等于面板拿不到这笔钱（issue #249）——POST /v1/videos 与
+// /v1/videos/generations 是同一个 handler，曾只登记了后者。
+//
+// GET 的查询路径（/v1/videos/{id}、/content）刻意不在表里：ServeHTTP 只对 POST 挂
+// trace，轮询不扣费，进归档只会把一次生成摊成 N 条 0 积分记录。
 func isChatEntry(path string) bool {
 	switch path {
 	case "/v1/chat/completions", "/v1/responses", "/v1/messages", "/messages",
 		"/v1/images/generations", "/v1/images/edits",
-		"/v1/videos/generations", "/v1/videos/tasks", "/v1/3d/generations", "/v1/3d/tasks":
+		"/v1/videos", "/v1/videos/generations", "/v1/videos/tasks",
+		"/v1/3d/generations", "/v1/3d/tasks":
 		return true
 	}
 	return false
@@ -449,7 +457,43 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
 		},
 		"sticky_sessions": sticky,
-		"redis_mode":      redisMode,
+		// credits 顶层积分汇总：把「可用量」直接摊到接口根部，外部集成（如面板/费用
+		// 插件）不必自己遍历 accounts 再求和 —— 那种做法每个消费方都要重复实现，
+		// 且极易漏掉「禁用号的 credits 已是 0、credits_raw 是快照」的语义差别。
+		//
+		// available = 健康/冷却/暂停号的可用积分（禁用号已是 0）；
+		// snapshot  = 含禁用号快照的总量（= 把死钱也算进去的旧口径，仅供诊断对照）；
+		// quota     = 可用号的总额度。三者分开写，避免读者猜。
+		"credits": func() map[string]any {
+			var available, snapshot, quota int64
+			byRealm := map[string]map[string]int64{}
+			for _, st := range h.cfg.Pool.List() {
+				available += st.Credits
+				snapshot += st.CreditsRaw
+				if st.CreditsTotal > 0 {
+					quota += st.CreditsTotal
+				}
+				r := st.Realm
+				if r == "" {
+					r = "cn"
+				}
+				agg := byRealm[r]
+				if agg == nil {
+					agg = map[string]int64{}
+					byRealm[r] = agg
+				}
+				agg["available"] += st.Credits
+				agg["snapshot"] += st.CreditsRaw
+				agg["quota"] += st.CreditsTotal
+			}
+			return map[string]any{
+				"available": available,
+				"snapshot":  snapshot,
+				"quota":     quota,
+				"by_realm":  byRealm,
+			}
+		}(),
+		"redis_mode": redisMode,
 		// model_locks 当前有未过期模型级限流的 (域, 模型) 全清单（移植上游 PR #120）：
 		// accounts 回答「哪些号不能用」，本键回答「哪些模型不能用、锁了几个号、还要锁多久」。
 		// 与 ModelBlocked（请求失败时的单模型判定）互补；无锁时为 null。只增键，零回归。
@@ -1879,15 +1923,37 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeStreamError
 				// 上游 body 是活的（200 长流），随轮转立即关闭，不留给函数末尾的 defer 堆 fd。
 				rc.Close()
-				fail(acct.UID)
+				frameKind := upstream.ErrNone
+				if hv.Payload != "" {
+					frameKind = upstream.FrameKind(hv.Payload)
+				}
+				if _, requestLevel := requestErrorCodes[frameKind]; requestLevel {
+					// 请求级错误与账号无关：只释放租约、不解绑会话，同 HTTP 路径的 11115 / 图片无效 / 11148。
+					failKeepBinding(acct.UID)
+				} else {
+					fail(acct.UID)
+				}
 				if hv.Payload == "" {
 					// 零有效帧：上游缺陷，不是账号的问题（不罚号），但换号值得一试。
 					lastErr = sErr
 					log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (no byte written, rotating)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 				} else {
 					// 帧内错误没有独立 HTTP 状态：末端映射只看 Kind，Status 仅作信封占位。
-					kind := upstream.FrameKind(hv.Payload)
+					kind := frameKind
 					h.applyErrorPolicy(acct.UID, kind, hv.Payload, bareModel, nil)
+					// 请求本身的错误（内容拦截 / 超长 / 参数 / 工具定义……）以「200 + 首帧 error 帧」
+					// 出现时与 HTTP ≥400 路径同口径：同一 body 换任何账号都是同一个拒绝，立即回 400
+					// 并透传 error 帧原文。否则轮转额度烧完后落到末端 503 no_healthy_account，
+					// 客户端把必然失败的请求当可重试反复重发。客户端一个字节都没收到，状态码还能改。
+					if code, ok := requestErrorCodes[kind]; ok {
+						log.Printf("WARN: [server] stream acct=%s model=%s: request-level error frame before first byte kind=%s payload=%s (not rotating)",
+							logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(hv.Payload, 200))
+						writeOpenAIErrorHint(w, http.StatusBadRequest, code, hv.Payload,
+							h.hintOf(kind, hv.Payload, bareModel, reqHasImage, nil))
+						st.status = http.StatusBadRequest
+						st.outcome = reqlog.OutcomeHTTPError
+						return
+					}
 					lastErr = &upstream.Error{Kind: kind, Msg: hv.Payload}
 					log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame before first byte kind=%s payload=%s (rotating)",
 						logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(hv.Payload, 200))
@@ -2285,6 +2351,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		status = http.StatusBadRequest
 	}
+	// 模型规则兜底：池里有号、号也健康，但本域所有账号都被人工规则挡住了这个模型。
+	// 规则不会自愈（与模型级冷却不同），落到 no_healthy_account（503）会被客户端当成
+	// 上游抖动反复重试；这里回 400 + 可辨识 code，让调用方知道"换模型才有用"。
+	if code == "no_healthy_account" && h.cfg.Pool != nil {
+		if blocked, eligible := h.cfg.Pool.RulesBlockedForRealm(curModel, realm); eligible > 0 && blocked == eligible {
+			status, code = http.StatusBadRequest, "model_not_allowed"
+			quota, quotaCode = false, 0
+			msg = "this model is not allowed for any account in this group (model rules); try another model"
+			hint = fmt.Sprintf("model_rules: %d/%d account(s) blocked by model rules", blocked, eligible)
+		}
+	}
 	if proxypool.IsError(lastErr) {
 		status, code, msg, hint = http.StatusServiceUnavailable, "proxy_unavailable", lastErr.Error(), ""
 		retryAfterSec, quotaCode, quota = 0, 0, false
@@ -2529,6 +2606,19 @@ func egressKey(a *auth.Auth) string {
 		realm = a.Realm()
 	}
 	return "direct:" + realm
+}
+
+// requestErrorCodes 请求级上游错误 → 400 的 error.code：错在请求本身，同一 body 换任何账号
+// 都是同一个拒绝，回 503 会被中转站当成可重试。首帧 error 帧的即刻 400 与托管工具探测的
+// 止损共用这张表；码值与轮转循环里 HTTP ≥400 分支的即刻 400 一致。
+var requestErrorCodes = map[upstream.ErrKind]string{
+	upstream.ErrContentBlocked:    "content_blocked",
+	upstream.ErrPromptTooLong:     "prompt_too_long",
+	upstream.ErrImageInvalid:      "image_invalid",
+	upstream.ErrToolMismatch:      "tool_call_mismatch",
+	upstream.ErrBadParams:         "bad_params",
+	upstream.ErrModelParamInvalid: "model_param_invalid",
+	upstream.ErrEmptyContent:      "empty_content",
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。

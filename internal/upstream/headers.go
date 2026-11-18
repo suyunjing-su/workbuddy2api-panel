@@ -21,7 +21,7 @@ const (
 	// 取值来源：官方分发包 resources/install-manifest.json（appVersion）+ cli/product.json
 	// （genieVersion）。
 	//
-	//	国内版 WorkBuddy      5.9.3（endpoint www.workbuddy.cn，DefaultModelOptimizationOff=false）
+	//	国内版 WorkBuddy      5.11.3（endpoint www.workbuddy.cn，DefaultModelOptimizationOff=false）
 	//	国际版 WorkBuddy AI   5.9.4（endpoint www.workbuddy.ai，isOversea=true）
 	//
 	// 5.9.4 国际版取值证据（2026-10-30 拆包 + 真机抓包）：
@@ -30,12 +30,29 @@ const (
 	//   - 真机 X-IDE-Version: 5.9.4，/v3/config UA = `WorkBuddy/5.9.4 CLI/2.165.0`
 	//
 	// config upstream.client_version 可覆盖（空 = 按 realm 取内置默认）。
-	defaultClientVersionCN     = "5.9.3"
+	//
+	// issue #257（2026-11-18 真机抓包后已修一半）：5.11.3 桌面端比 5.9.3 多一层出站头
+	// 注入（app.asar 的 proxy-env2 registerOutboundHeaderProvider），对产品 endpoint
+	// 追加 X-Client-Version / X-Client-Platform / X-Client-Product，以及来自 Turing SDK
+	// 的 X-Device-Token。三个 X-Client-* 现已按 realm 隔离注入（只发国内版，见
+	// injectClientIdentityHeaders）；X-Device-Token 仍不发——取值只有客户端 Turing SDK
+	// 能产，网关没有等价来源，账号配了 device_token 时才由 injectDeviceToken 带上。
+	// 抓包证据与结论见 docs/issue-257-client-identity.md。
+	defaultClientVersionCN     = "5.11.3"
 	defaultClientVersionGlobal = "5.9.4"
-	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI **2.165.0**
-	// （cli/package.json 的 @genie/agent-cli version；5.9.3 真机 UA 实测同值）。
+	// defaultCliVersion* 出站 UA 中 `CLI/<ver>` 段版本 = 各分发包内置的 @genie/agent-cli，
+	// **随包走、不是一个全局值**：CN 5.11.3 包带 2.176.0，国际分发包最新仍停在 5.9.4
+	// （带 2.165.0；2026-11 Homebrew workbuddy-ai cask version 仍是 5.9.4.42593613）。
 	// config upstream.cli_version 可覆盖。
-	defaultCliVersion = "2.165.0"
+	defaultCliVersionCN     = "2.176.0"
+	defaultCliVersionGlobal = "2.165.0"
+
+	// defaultClientIdentityPlatform / defaultClientIdentityProduct 5.11.3 桌面端
+	// X-Client-* 头里的两段固定值。真机国内版全量样本恒为 windows / WorkBuddy
+	// （mac 包会是 macos；产品名取 product config 的 applicationName），2026-11-18
+	// 抓包 130 次命中无一例外。版本段不在这里，走 clientVersion（可被 config 覆盖）。
+	defaultClientIdentityPlatform = "windows"
+	defaultClientIdentityProduct  = "WorkBuddy"
 
 	// originRefererCN / originRefererGlobal 只给**web 层**（渲染器/登录页那类浏览器语义
 	// 的请求）用，RPC 层不发（见 CommonHeaders 注释）。
@@ -59,7 +76,7 @@ func originRefererFor(a *auth.Auth) string {
 }
 
 // clientVersion 生效的 WorkBuddy 客户端版本：Client.ClientVersion 非空则取之，
-// 否则按 realm 取内置默认（CN 5.8.3 / global 5.8.4）。
+// 否则按 realm 取内置默认（CN 5.11.3 / global 5.9.4）。
 func (c *Client) clientVersion(a *auth.Auth) string {
 	if c != nil && c.ClientVersion != "" {
 		return c.ClientVersion
@@ -70,12 +87,62 @@ func (c *Client) clientVersion(a *auth.Auth) string {
 	return defaultClientVersionCN
 }
 
-// cliVersion 生效的 CLI 版本：Client.CliVersion 非空则取之，否则内置默认 defaultCliVersion。
-func (c *Client) cliVersion() string {
+// defaultCliVersionFor 按 realm 取内置 CLI 版本（分发包自带，两版不同档）。
+func defaultCliVersionFor(a *auth.Auth) string {
+	if a != nil && a.IsGlobal() {
+		return defaultCliVersionGlobal
+	}
+	return defaultCliVersionCN
+}
+
+// cliVersion 生效的 CLI 版本：Client.CliVersion 非空则取之，否则按 realm 取内置默认。
+func (c *Client) cliVersion(a *auth.Auth) string {
 	if c != nil && c.CliVersion != "" {
 		return c.CliVersion
 	}
-	return defaultCliVersion
+	return defaultCliVersionFor(a)
+}
+
+// injectClientIdentityHeaders 注入 5.11.3 桌面端新增的 X-Client-* 三头。
+//
+// **只对国内版发，国际版一律不发**（issue #257 的隔离口径）。理由是两侧分发包不同：
+// 国际版停在 5.9.4，app.asar 里没有 proxy-env2 的 registerOutboundHeaderProvider，
+// 官方国际客户端从不发这三个头；把国内的 5.11.3 形态套到国际链路，等于给那条链加
+// 一层它不存在的指纹。版本号（UA / X-IDE-Version）本来就按 realm 各取各的，头集也
+// 必须各归各的，不能因为「国内升到 5.11.3」就让国际链路跟着变形状。
+//
+// 依据（2026-11-18 真机抓包，国内桌面端 5.11.3，见 docs/issue-257-client-identity.md）：
+//   - 三个头在 130 次命中里**恒同现**，取值固定 5.11.3 / windows / WorkBuddy；
+//   - 覆盖范围比静态分析预期的大得多：不只 RPC 族（/v2/report、/v2/chat/busy、
+//     refresh、/console/*、billing），/v2/chat/completions 与 /v3/config 也带——
+//     注入点在全局 axios/undici 拦截器，按 origin 判定，不按路径；
+//   - 官方客户端自身的头序三族各异（node fetch / axios / 渲染器），且 Go 的
+//     net/http 落盘时按字典序写头，逐字节复刻头序不可行、也不是判别特征，故不复刻。
+//
+// X-Device-Token 不在这里补：真机确实几乎每请求都带（1254 字符），但它的取值来自
+// 客户端 Turing SDK，网关侧没有等价来源，凭空造一个反而更可疑；账号配了
+// device_token 时由 injectDeviceToken 在它自己的调用点注入（issue #257 未决项）。
+func (c *Client) injectClientIdentityHeaders(req *http.Request, a *auth.Auth) {
+	if a == nil || a.IsGlobal() {
+		return
+	}
+	req.Header.Set("X-Client-Version", c.clientVersion(a))
+	req.Header.Set("X-Client-Platform", defaultClientIdentityPlatform)
+	req.Header.Set("X-Client-Product", defaultClientIdentityProduct)
+}
+
+// dropClientIdentityHeaders 撤掉 injectClientIdentityHeaders 注入的三头，供**小程序口径**
+// 的请求使用（tasks.go 的 growthJSONMP / ClaimRewardMP）。
+//
+// 为什么必须撤：这三个头来自桌面端 5.11.3 的 origin 注入，小程序那条链路根本不存在这一层。
+// 这些路径都是先 BillingHeaders（CN 号会把三头打上）再覆盖 X-Client-Platform: miniprogram，
+// 不撤就会发出 `5.11.3 / miniprogram / WorkBuddy` —— 桌面端不会说 miniprogram，
+// 小程序也不会自报 5.11.3 与 WorkBuddy（真机小程序是 2.4.0 / mp-weixin / workbuddy-mp，
+// 见 mp_events.go），是个谁都不像的第四种组合。
+func (c *Client) dropClientIdentityHeaders(req *http.Request) {
+	req.Header.Del("X-Client-Version")
+	req.Header.Del("X-Client-Platform")
+	req.Header.Del("X-Client-Product")
 }
 
 // defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方 `buildUserAgent` 形态）：
@@ -83,11 +150,11 @@ func (c *Client) cliVersion() string {
 //
 // 首段**恒为驼峰 `WorkBuddy`**，只有第二段随 realm 换品牌：
 //
-//	CN 5.9.3     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+//	CN 5.11.3    → WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0
 //	global 5.8.4 → WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.165.0
 //
 // 2026-10-28 国内版 **5.9.3** 真机抓包复核（/v2/chat/completions ×7）实测仍是上式，
-// 客户端与 CLI 版本段同步升到 5.9.3 / 2.165.0。
+// 客户端与 CLI 版本段同步升到 5.11.3 / 2.176.0。
 //
 // 2026-10-21 国际版 5.8.4 GUI 真机抓包（/v2/chat/completions，主对话 + 标题生成
 // 两条）实测即为上式：官方 chat 走 OpenAI SDK（请求带 x-stainless-* 头），SDK 的
@@ -100,7 +167,7 @@ func (c *Client) cliVersion() string {
 // 官方无任何 UA 随机化，故默认确定性。
 func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
 	ver := c.clientVersion(a)
-	return "WorkBuddy/" + ver + " " + uaBrandFor(a) + "/" + ver + " CLI/" + c.cliVersion()
+	return "WorkBuddy/" + ver + " " + uaBrandFor(a) + "/" + ver + " CLI/" + c.cliVersion(a)
 }
 
 // uaBrandFor 出站 UA 的**第二段**品牌：按 realm 取，两版形态不同（不同分发包）。
@@ -134,7 +201,7 @@ func (c *Client) defaultWorkBuddyUA() string {
 //
 // 2026-10-30 双版本真机抓包（国际 5.9.4 / 国内 5.9.3）**两版同一形态**：
 //
-//	CN 5.9.3     → WorkBuddy/5.9.3 CLI/2.165.0
+//	CN 5.11.3    → WorkBuddy/5.11.3 CLI/2.176.0
 //	global 5.9.4 → WorkBuddy/5.9.4 CLI/2.165.0
 //
 // 都是两段、单品牌。旧实现在 CN 下发三段重复品牌（`WorkBuddy/<ver> WorkBuddy/<ver>
@@ -155,7 +222,7 @@ func (c *Client) v3ProbeUA(a *auth.Auth) string {
 // 退化为重复请求，无害）。**不要**据此认为存在「按 UA 分族的第三族模型」：
 // 2026-10-30 实测国内 5.9.3 两族返回完全相同，global 侧两路本来就同串。
 func (c *Client) v3ProbeUALite(a *auth.Auth) string {
-	return "WorkBuddy/" + c.clientVersion(a) + " CLI/" + c.cliVersion()
+	return "WorkBuddy/" + c.clientVersion(a) + " CLI/" + c.cliVersion(a)
 }
 
 // rpcUAFor 桌面端 **RPC/REST 层**出站 UA（不是 chat 那条 SDK 链）。
@@ -168,7 +235,7 @@ func (c *Client) v3ProbeUALite(a *auth.Auth) string {
 // RPC 族覆盖 /v2/report、/v2/chat/busy、/console/as/*、/v2/plugin/auth/token/refresh、
 // /v2/as/scheduler/tasks、/v2/user-asset/*、/portal/*：
 //
-//	CN 5.9.3     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+//	CN 5.11.3    → WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0
 //	global 5.9.4 → workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0
 //
 // CN 下与 userAgent() 同值（品牌段本来就是驼峰），只有 global 会分叉——旧实现让
@@ -179,7 +246,7 @@ func (c *Client) rpcUAFor(a *auth.Auth) string {
 	}
 	ver := c.clientVersion(a)
 	brand := uaBrandFor(a)
-	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + c.cliVersion()
+	return brand + "/" + ver + " " + brand + "/" + ver + " CLI/" + c.cliVersion(a)
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
@@ -297,6 +364,10 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	// Origin+Referer，等于给每个 RPC 请求盖一个浏览器痕迹——反而不是客户端形态。
 	// 需要浏览器语义的调用方（登录页 / web 层）自行设置 originRefererFor。
 	req.Header.Set("User-Agent", c.rpcUAFor(a))
+	// 5.11.3 的 X-Client-* 身份头：按 realm 隔离注入（国际版不发），见
+	// injectClientIdentityHeaders。放在这里是因为 chat / refresh / v3-config /
+	// console 各族都从 CommonHeaders 起头，一处覆盖 RPC 层全部路径。
+	c.injectClientIdentityHeaders(req, a)
 	// X-CodeBuddy-Request：**只有 chat 带**（见 ChatHeaders）。5.9.3 真机全量扫描——
 	// 7 条 /v2/chat/completions 全带（`x-codebuddy-request: 1`），而 busy / report /
 	// refresh / v3-config / billing 等 30+ 条业务路径**一条都没有**。旧实现把它放在
@@ -472,7 +543,7 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// `WorkBuddy/<ver>`，第二段才是品牌 slug——与 RPC/REST 层（首段即 slug，见
 	// rpcUAFor）不同。CommonHeaders 已按 RPC 形态设过，这里按 chat 形态覆盖。
 	//
-	//	CN 5.9.3     → WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0
+	//	CN 5.11.3    → WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0
 	//	global 5.9.4 → WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0
 	//
 	// 2026-10-30 双版本真机 /v2/chat/completions 实测即上式（同一会话里 RPC 族
@@ -920,6 +991,9 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	}
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
 	c.injectDeviceToken(req, a)
+	// X-Client-* 身份头：billing 真机同样带（3/3 条 resource-summary 全有），
+	// 与 RPC 层同口径按 realm 隔离。
+	c.injectClientIdentityHeaders(req, a)
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
